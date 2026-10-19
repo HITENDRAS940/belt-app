@@ -1,214 +1,380 @@
-/**
- * CareBelt Smart Belt Firmware for Alzheimer's & Dementia Patients
- * Hardware:
- *   - MCU: ESP32 Dev Module
- *   - GPS: u-blox NEO-6M connected to UART2 (ESP32 RX2 = GPIO 16, TX2 = GPIO 17)
- *   - Haptics: Coin / Cylinder Vibration Motor on GPIO 25 (via NPN/MOSFET driver)
- *   - Optional Clasp Sensor: Magnetic Reed / Hall Switch on GPIO 26 (INPUT_PULLUP)
- *   - Optional SOS Button: Tactile Pushbutton on GPIO 27 (INPUT_PULLUP)
- *
- * Dependencies (Arduino Library Manager):
- *   - TinyGPSPlus by Mikal Hart
- *
- * HTTP REST API consumed by the CareBelt Kotlin Android App:
- *   - GET  /location -> Returns JSON telemetry from NEO-6M GPS + belt sensors
- *   - POST /vibrate?pattern=gentle_pulse&durationMs=1200 -> Triggers haptic pattern
- *   - GET  /status   -> Health check
- */
-
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <TinyGPSPlus.h>
 
-// -------------------- Wi-Fi Configuration --------------------
-const char* WIFI_SSID     = "YOUR_WIFI_OR_HOTSPOT_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+// =====================================================
+// CAREBELT: ADVANCED WANDERING & OBSTACLE ASSISTANCE
+// =====================================================
 
-// Fallback SoftAP credentials if Wi-Fi router/hotspot is not in range
+// --- WI-FI CREDENTIALS ---
+const char* WIFI_SSID     = "OnePlus 10R 5G";   // Replace with your Wi-Fi SSID
+const char* WIFI_PASSWORD = "notfreewifi";        // Replace with your Wi-Fi Password
+
+// Fallback SoftAP credentials if Wi-Fi router is out of range
 const char* AP_SSID       = "CareBelt-ESP32";
-const char* AP_PASSWORD   = "carebelt123"; // Default IP: 192.168.4.1
+const char* AP_PASSWORD   = "carebelt123";
 
-// -------------------- Hardware Pin Definitions --------------------
-static const int GPS_RX_PIN        = 16;   // Connect to NEO-6M TX
-static const int GPS_TX_PIN        = 17;   // Connect to NEO-6M RX
-static const uint32_t GPS_BAUD     = 9600; // NEO-6M default baud rate
+WebServer server(80);
 
-static const int VIBRATION_PIN     = 25;   // Vibration motor transistor gate/base
-static const int CLASP_SENSOR_PIN  = 26;   // LOW = Belt buckled, HIGH = Unbuckled
-static const int SOS_BUTTON_PIN    = 27;   // LOW = SOS pressed
-static const int BATTERY_ADC_PIN   = 34;   // Voltage divider from LiPo battery
+// --- GPS CONFIGURATION (UART2) ---
+static const int GPS_RX_PIN        = 16;   // NEO-6M TX -> ESP32 RX2
+static const int GPS_TX_PIN        = 17;   // NEO-6M RX -> ESP32 TX2
+static const uint32_t GPS_BAUD     = 9600;
 
-// -------------------- Global Instances --------------------
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);
-WebServer server(80);
 
 // Fallback coordinates before first outdoor satellite lock (New Delhi default)
 double lastValidLat = 28.613900;
 double lastValidLng = 77.209000;
 bool hasEverLockedGps = false;
 
-// Non-blocking vibration state machine
-bool isVibrating = false;
-unsigned long vibrationStartMs = 0;
-unsigned long vibrationDurationMs = 0;
-String activePattern = "none";
+// --- HAPTIC MOTOR PINS (Moved off 16 & 17) ---
+const int MOTOR_FRONT = 4;
+const int MOTOR_RIGHT = 5;
+const int MOTOR_LEFT  = 18;
 
-// -------------------- Non-Blocking Vibration Engine --------------------
-void startVibrationPattern(const String& pattern, unsigned long durationMs) {
-  activePattern = pattern;
-  vibrationStartMs = millis();
-  vibrationDurationMs = constrain(durationMs, 200UL, 8000UL);
-  isVibrating = true;
+// --- ULTRASONIC SENSOR PINS ---
+const int FRONT_TRIG = 19;
+const int FRONT_ECHO = 21;
+
+const int RIGHT_TRIG = 22;
+const int RIGHT_ECHO = 23;
+
+const int LEFT_TRIG  = 32;
+const int LEFT_ECHO  = 33;
+
+const int DOWN_TRIG  = 25; // Terrain / Pothole sensor
+const int DOWN_ECHO  = 26;
+
+// --- SAFETY & SENSOR VARIABLES ---
+const int CLASP_SENSOR_PIN = 12; // LOW = Belt buckled
+const int SOS_BUTTON_PIN   = 14; // LOW = SOS pressed
+
+float distanceCM[4];         // 0: Front, 1: Right, 2: Left, 3: Down
+float previousDistanceCM[4];
+float velocityCMs[4];
+
+const float MAX_DISTANCE = 300.0;
+const float OBSTACLE_DISTANCE = 120.0;
+const float DROPOFF_THRESHOLD = 110.0;      // Pothole / drop-off
+const float UPWARD_STAIR_THRESHOLD = 35.0;  
+
+// Timing
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 100; // ms
+unsigned long lastSerialPrint = 0;
+const unsigned long SERIAL_PRINT_INTERVAL = 1000; // ms
+unsigned long previousTime = 0;
+
+// System States
+enum Urgency { U_SAFE, U_LOW, U_MEDIUM, U_HIGH, U_CRITICAL };
+Urgency currentUrgency = U_SAFE;
+
+enum Direction { NONE, FRONT, RIGHT, LEFT, BACK };
+Direction safestDirection = NONE;
+
+bool hapticState = false;
+unsigned long lastHapticToggle = 0;
+
+// =====================================================
+// ULTRASONIC LOGIC
+// =====================================================
+float readUltrasonic(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 25000); // 25ms timeout (~4m max)
+  if (duration == 0) return -1;
+
+  float distance = duration * 0.0343 / 2.0;
+  if (distance > MAX_DISTANCE) distance = MAX_DISTANCE;
+  if (distance < 2) distance = 2;
+  return distance;
 }
 
-void updateVibrationMotor() {
-  if (!isVibrating) {
-    digitalWrite(VIBRATION_PIN, LOW);
-    return;
+void readSensors() {
+  distanceCM[0] = readUltrasonic(FRONT_TRIG, FRONT_ECHO);
+  delay(4);
+  distanceCM[1] = readUltrasonic(RIGHT_TRIG, RIGHT_ECHO);
+  delay(4);
+  distanceCM[2] = readUltrasonic(LEFT_TRIG, LEFT_ECHO);
+  delay(4);
+  distanceCM[3] = readUltrasonic(DOWN_TRIG, DOWN_ECHO);
+}
+
+void calculateVelocity() {
+  unsigned long currentTime = millis();
+  float dt = (currentTime - previousTime) / 1000.0;
+  if (dt <= 0) return;
+
+  for (int i = 0; i < 3; i++) {
+    if (distanceCM[i] < 0 || previousDistanceCM[i] < 0) {
+      velocityCMs[i] = 0;
+    } else {
+      velocityCMs[i] = (previousDistanceCM[i] - distanceCM[i]) / dt;
+    }
+  }
+  previousTime = currentTime;
+}
+
+float calculateTTC(int sensorIndex) {
+  float distance = distanceCM[sensorIndex];
+  float closingSpeed = velocityCMs[sensorIndex];
+  if (distance < 0 || closingSpeed <= 0) return 9999.0;
+  return distance / closingSpeed;
+}
+
+Urgency determineUrgency() {
+  float minimumTTC = 9999.0;
+  bool obstacleDetected = false;
+
+  for (int i = 0; i < 3; i++) {
+    if (distanceCM[i] >= 0 && distanceCM[i] < OBSTACLE_DISTANCE) {
+      obstacleDetected = true;
+      float ttc = calculateTTC(i);
+      if (ttc < minimumTTC) minimumTTC = ttc;
+    }
   }
 
-  unsigned long elapsed = millis() - vibrationStartMs;
-  if (elapsed >= vibrationDurationMs) {
-    isVibrating = false;
-    activePattern = "none";
-    digitalWrite(VIBRATION_PIN, LOW);
-    return;
-  }
+  if (distanceCM[3] > DROPOFF_THRESHOLD) return U_CRITICAL;       // Drop-off
+  if (distanceCM[3] < UPWARD_STAIR_THRESHOLD) return U_HIGH;    // Stair climb
+  if (!obstacleDetected) return U_SAFE;
 
-  // Distinct haptic rhythms for Alzheimer's / Dementia wearer cues
-  if (activePattern == "gentle_pulse") {
-    // Soft double-pulse: 250ms ON, 200ms OFF
-    bool motorOn = ((elapsed % 450) < 250);
-    digitalWrite(VIBRATION_PIN, motorOn ? HIGH : LOW);
-  } else if (activePattern == "return_home") {
-    // Directional guiding heartbeat: 400ms ON, 250ms OFF
-    bool motorOn = ((elapsed % 650) < 400);
-    digitalWrite(VIBRATION_PIN, motorOn ? HIGH : LOW);
-  } else if (activePattern == "boundary_alert") {
-    // Urgent 3-pulse safe-zone warning: 180ms ON, 120ms OFF
-    bool motorOn = ((elapsed % 300) < 180);
-    digitalWrite(VIBRATION_PIN, motorOn ? HIGH : LOW);
-  } else {
-    // Continuous buzz for "find_belt"
-    digitalWrite(VIBRATION_PIN, HIGH);
+  if (minimumTTC < 1.0) return U_CRITICAL;
+  if (minimumTTC < 2.0) return U_HIGH;
+  if (minimumTTC < 4.0) return U_MEDIUM;
+  return U_LOW;
+}
+
+void calculateSafeDirection() {
+  float front = (distanceCM[0] < 0) ? MAX_DISTANCE : distanceCM[0];
+  float right = (distanceCM[1] < 0) ? MAX_DISTANCE : distanceCM[1];
+  float left  = (distanceCM[2] < 0) ? MAX_DISTANCE : distanceCM[2];
+
+  bool frontBlocked = (front < OBSTACLE_DISTANCE);
+  bool rightBlocked = (right < OBSTACLE_DISTANCE);
+  bool leftBlocked  = (left < OBSTACLE_DISTANCE);
+
+  if (!frontBlocked) { safestDirection = FRONT; return; }
+  if (!leftBlocked && rightBlocked) { safestDirection = LEFT; return; }
+  if (leftBlocked && !rightBlocked) { safestDirection = RIGHT; return; }
+  if (!leftBlocked && !rightBlocked) { safestDirection = (left >= right) ? LEFT : RIGHT; return; }
+  safestDirection = BACK;
+}
+
+// =====================================================
+// MOTOR CONTROL
+// =====================================================
+void stopMotors() {
+  digitalWrite(MOTOR_FRONT, LOW);
+  digitalWrite(MOTOR_RIGHT, LOW);
+  digitalWrite(MOTOR_LEFT,  LOW);
+}
+
+void setDirectionalFeedback() {
+  stopMotors();
+  switch (safestDirection) {
+    case FRONT: digitalWrite(MOTOR_FRONT, HIGH); break;
+    case RIGHT: digitalWrite(MOTOR_RIGHT, HIGH); break;
+    case LEFT:  digitalWrite(MOTOR_LEFT,  HIGH); break;
+    case BACK:  
+      digitalWrite(MOTOR_FRONT, HIGH);
+      digitalWrite(MOTOR_RIGHT, HIGH);
+      digitalWrite(MOTOR_LEFT,  HIGH); 
+      break;
+    default: stopMotors(); break;
   }
 }
 
-// -------------------- Battery & Sensor Helpers --------------------
-int readBatteryPercent() {
-  // Example LiPo voltage divider on GPIO 34 (falls back to 88% if unconnected)
-  int raw = analogRead(BATTERY_ADC_PIN);
-  if (raw <= 100) return 88;
-  int pct = map(raw, 2000, 2600, 0, 100);
-  return constrain(pct, 5, 100);
+int getPulseInterval() {
+  switch (currentUrgency) {
+    case U_SAFE:     return 0;
+    case U_LOW:      return 1000;
+    case U_MEDIUM:   return 500;
+    case U_HIGH:     return 250;
+    case U_CRITICAL: return 100;
+  }
+  return 1000;
 }
 
-// -------------------- HTTP Route Handlers --------------------
-void handleGetLocation() {
+// =====================================================
+// WEB SERVER DASHBOARD & API
+// =====================================================
+String getUrgencyString() {
+  switch (currentUrgency) {
+    case U_SAFE:     return "SAFE";
+    case U_LOW:      return "LOW";
+    case U_MEDIUM:   return "MEDIUM";
+    case U_HIGH:     return "HIGH";
+    case U_CRITICAL: return "CRITICAL";
+  }
+  return "UNKNOWN";
+}
+
+void handleDataJson() {
   if (gps.location.isValid()) {
     lastValidLat = gps.location.lat();
     lastValidLng = gps.location.lng();
     hasEverLockedGps = true;
   }
 
-  double speedKmh = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
-  int satellites  = gps.satellites.isValid() ? gps.satellites.value() : 0;
-  double hdop     = gps.hdop.isValid() ? (gps.hdop.value() / 100.0) : 1.5;
-  double altitude = gps.altitude.isValid() ? gps.altitude.meters() : 215.0;
-  double course   = gps.course.isValid() ? gps.course.deg() : 0.0;
-
-  bool beltFastened = (digitalRead(CLASP_SENSOR_PIN) == LOW);
-  bool sosPressed   = (digitalRead(SOS_BUTTON_PIN) == LOW);
-  int batteryPct    = readBatteryPercent();
-
   String json = "{";
-  json += "\"patientName\":\"Patient #1 (ESP32 Belt)\",";
   json += "\"latitude\":" + String(lastValidLat, 6) + ",";
   json += "\"longitude\":" + String(lastValidLng, 6) + ",";
-  json += "\"speedKmh\":" + String(speedKmh, 2) + ",";
-  json += "\"satellites\":" + String(satellites) + ",";
-  json += "\"hdop\":" + String(hdop, 2) + ",";
-  json += "\"altitude\":" + String(altitude, 1) + ",";
-  json += "\"courseDeg\":" + String(course, 1) + ",";
+  json += "\"satellites\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + ",";
   json += "\"hasFix\":" + String(hasEverLockedGps ? "true" : "false") + ",";
-  json += "\"batteryPercent\":" + String(batteryPct) + ",";
-  json += "\"beltWorn\":" + String(beltFastened ? "true" : "false") + ",";
-  json += "\"sosActive\":" + String(sosPressed ? "true" : "false") + ",";
-  json += "\"vibrating\":" + String(isVibrating ? "true" : "false");
+  json += "\"front\":" + String(distanceCM[0]) + ",";
+  json += "\"right\":" + String(distanceCM[1]) + ",";
+  json += "\"left\":"  + String(distanceCM[2]) + ",";
+  json += "\"down\":"  + String(distanceCM[3]) + ",";
+  json += "\"urgency\":\"" + getUrgencyString() + "\",";
+  json += "\"beltWorn\":" + String(digitalRead(CLASP_SENSOR_PIN) == LOW ? "true" : "false") + ",";
+  json += "\"sosActive\":" + String(digitalRead(SOS_BUTTON_PIN) == LOW ? "true" : "false");
   json += "}";
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
 }
 
-void handlePostVibrate() {
-  String pattern = server.hasArg("pattern") ? server.arg("pattern") : "gentle_pulse";
-  unsigned long durationMs = server.hasArg("durationMs")
-      ? server.arg("durationMs").toInt()
-      : 1500UL;
-
-  startVibrationPattern(pattern, durationMs);
-
-  String response = "{\"status\":\"ok\",\"pattern\":\"" + pattern +
-                    "\",\"durationMs\":" + String(durationMs) + "}";
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", response);
+void handleRoot() {
+  String html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>CareBelt Tracker & Navigation</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; margin: 0; padding: 20px; }
+      h1 { color: #00E676; margin-bottom: 10px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 15px; max-width: 600px; margin: auto; }
+      .card { background: #1E1E1E; padding: 15px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+      .card h3 { margin: 0 0 10px 0; color: #BBB; font-size: 14px; }
+      .value { font-size: 20px; font-weight: bold; color: #00E676; }
+      .status-box { background: #1E1E1E; max-width: 600px; margin: 20px auto; padding: 15px; border-radius: 10px; text-align: left; }
+      .status-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; }
+    </style>
+    <script>
+      setInterval(function() {
+        fetch('/data')
+          .then(res => res.json())
+          .then(data => {
+            document.getElementById('lat').innerText = data.latitude.toFixed(6);
+            document.getElementById('lng').innerText = data.longitude.toFixed(6);
+            document.getElementById('sats').innerText = data.satellites;
+            document.getElementById('urgency').innerText = data.urgency;
+            document.getElementById('belt').innerText = data.beltWorn ? "BUCKLED" : "UNBUCKLED";
+            document.getElementById('sos').innerText = data.sosActive ? "ACTIVE!" : "NORMAL";
+          });
+      }, 1000);
+    </script>
+  </head>
+  <body>
+    <h1>CareBelt Dashboard</h1>
+    <p>Wandering Prevention & Obstacle Guidance System</p>
+    <div class="status-box">
+      <div class="status-row"><span>Latitude:</span><span class="value" id="lat">--</span></div>
+      <div class="status-row"><span>Longitude:</span><span class="value" id="lng">--</span></div>
+      <div class="status-row"><span>Satellites:</span><span class="value" id="sats">--</span></div>
+      <div class="status-row"><span>Obstacle Urgency:</span><span class="value" id="urgency">--</span></div>
+      <div class="status-row"><span>Belt Status:</span><span class="value" id="belt">--</span></div>
+      <div class="status-row"><span>SOS State:</span><span class="value" id="sos">--</span></div>
+    </div>
+  </body>
+  </html>
+  )rawliteral";
+  server.send(200, "text/html", html);
 }
 
-void handleStatus() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", "{\"status\":\"online\",\"device\":\"CareBelt-ESP32\"}");
-}
-
-// -------------------- Setup & Loop --------------------
+// =====================================================
+// SETUP & LOOP
+// =====================================================
 void setup() {
   Serial.begin(115200);
+
+  // Initialize GPS UART2
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
-  pinMode(VIBRATION_PIN, OUTPUT);
-  digitalWrite(VIBRATION_PIN, LOW);
+  // Configure Motor Outputs
+  pinMode(MOTOR_FRONT, OUTPUT);
+  pinMode(MOTOR_RIGHT, OUTPUT);
+  pinMode(MOTOR_LEFT,  OUTPUT);
+  stopMotors();
+
+  // Configure Ultrasonic Sensors
+  pinMode(FRONT_TRIG, OUTPUT); pinMode(FRONT_ECHO, INPUT);
+  pinMode(RIGHT_TRIG, OUTPUT); pinMode(RIGHT_ECHO, INPUT);
+  pinMode(LEFT_TRIG,  OUTPUT); pinMode(LEFT_ECHO,  INPUT);
+  pinMode(DOWN_TRIG,  OUTPUT); pinMode(DOWN_ECHO,  INPUT);
+
+  // Configure Safety Inputs
   pinMode(CLASP_SENSOR_PIN, INPUT_PULLUP);
-  pinMode(SOS_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SOS_BUTTON_PIN,   INPUT_PULLUP);
 
-  // Brief startup haptic pulse to confirm belt power-on
-  startVibrationPattern("gentle_pulse", 600);
+  previousTime = millis();
 
-  // Try connecting to configured Wi-Fi / Phone Hotspot for 8 seconds
+  // Wi-Fi Connection
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
   unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 8000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 7000) {
     delay(250);
     Serial.print(".");
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected! ESP32 IP Address: " + WiFi.localIP().toString());
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
   } else {
-    Serial.println("\nStarting SoftAP mode...");
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    Serial.println("\nFallback SoftAP Started. IP: 192.168.4.1");
   }
 
-  // Always start SoftAP fallback so caregiver phone can connect directly in the field
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  Serial.println("SoftAP IP Address: " + WiFi.softAPIP().toString());
-
-  server.on("/location", HTTP_GET, handleGetLocation);
-  server.on("/vibrate", HTTP_POST, handlePostVibrate);
-  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/", handleRoot);
+  server.on("/data", handleDataJson);
   server.begin();
 }
 
 void loop() {
-  // Continuously feed characters from NEO-6M GPS UART
+  // Feed GPS Data stream
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
   }
 
-  // Handle incoming HTTP requests from the Kotlin Android app
   server.handleClient();
 
-  // Drive non-blocking vibration motor patterns
-  updateVibrationMotor();
+  unsigned long currentTime = millis();
+
+  // Sensor reading block
+  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+    for (int i = 0; i < 4; i++) previousDistanceCM[i] = distanceCM[i];
+    readSensors();
+    calculateVelocity();
+    currentUrgency = determineUrgency();
+    calculateSafeDirection();
+    lastSensorRead = currentTime;
+  }
+
+  // Handle Safe Obstacle-Free State
+  if (currentUrgency == U_SAFE) {
+    stopMotors();
+    return;
+  }
+
+  // Handle Dynamic Haptic Obstacle / Stair Feedback
+  int pulseInterval = getPulseInterval();
+  if (currentTime - lastHapticToggle >= (unsigned long)pulseInterval) {
+    lastHapticToggle = currentTime;
+    hapticState = !hapticState;
+
+    if (hapticState) {
+      setDirectionalFeedback();
+    } else {
+      stopMotors();
+    }
+  }
 }
